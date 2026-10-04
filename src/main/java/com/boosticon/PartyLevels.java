@@ -3,8 +3,8 @@ package com.boosticon;
 import java.util.Arrays;
 
 /**
- * The levels a party member last told the party about. They arrive a stat at a time, as and when each
- * one changes, so every stat is kept until something newer arrives for it.
+ * What a party member last told the party about themselves. Levels arrive a stat at a time, as and when
+ * each one changes, so every stat is kept until something newer arrives for it.
  */
 class PartyLevels
 {
@@ -17,6 +17,12 @@ class PartyLevels
 
 	private final int[] boosted = new int[SIZE];
 	private final int[] real = new int[SIZE];
+
+	/**
+	 * The name of the player the levels belong to, as the member sharing them gave it, or nothing while
+	 * they have not said. It is what ties the levels to somebody on screen.
+	 */
+	private String name;
 
 	PartyLevels()
 	{
@@ -42,5 +48,15 @@ class PartyLevels
 	int[] getReal()
 	{
 		return real;
+	}
+
+	void setName(String name)
+	{
+		this.name = name;
+	}
+
+	String getName()
+	{
+		return name;
 	}
 }

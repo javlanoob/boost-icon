@@ -6,6 +6,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import javax.inject.Inject;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
@@ -94,8 +95,9 @@ public class BoostIconPlugin extends Plugin
 	private final Map<Long, PartyLevels> partyLevels = new HashMap<>();
 
 	/**
-	 * The levels last sent to the party, so a tick that changed nothing sends nothing.
+	 * What was last sent to the party, so a tick that changed nothing sends nothing.
 	 */
+	private String sentName;
 	private int[] sentBoosted;
 	private int[] sentReal;
 
@@ -204,9 +206,15 @@ public class BoostIconPlugin extends Plugin
 			}
 
 			PartyLevels levels = partyLevels.get(member.getMemberId());
-			String name = member.getDisplayName();
 
-			if (levels == null || name == null)
+			if (levels == null)
+			{
+				continue;
+			}
+
+			String name = nameOf(member, levels);
+
+			if (name == null)
 			{
 				continue;
 			}
@@ -269,10 +277,33 @@ public class BoostIconPlugin extends Plugin
 			return;
 		}
 
-		for (int i = 0; i < STATS.length; i++)
+		long memberId = message.getMemberId();
+		String name = message.getName();
+
+		if (!settings.partyStats())
 		{
-			record(message.getMemberId(), STATS[i], real[i], boosted[i]);
+			return;
 		}
+
+		clientThread.invoke(() ->
+		{
+			if (isOwn(memberId))
+			{
+				return;
+			}
+
+			PartyLevels levels = levelsFor(memberId);
+
+			if (name != null && !name.isEmpty())
+			{
+				levels.setName(name);
+			}
+
+			for (int i = 0; i < STATS.length; i++)
+			{
+				set(levels, STATS[i], boosted[i], real[i]);
+			}
+		});
 	}
 
 	@Subscribe
@@ -291,29 +322,6 @@ public class BoostIconPlugin extends Plugin
 	}
 
 	/**
-	 * One stat of one party member. Levels come from whoever is sharing them and are taken as nothing
-	 * more than numbers, so anything a stat could not be at is dropped rather than drawn.
-	 */
-	void record(long memberId, CombatStat stat, int level, int boostedLevel)
-	{
-		PartyMember local = partyService.getLocalMember();
-
-		if (!stat.isPossible(level) || !stat.isPossible(boostedLevel) || !settings.partyStats()
-			|| (local != null && local.getMemberId() == memberId))
-		{
-			return;
-		}
-
-		clientThread.invoke(() ->
-		{
-			PartyLevels levels = partyLevels.computeIfAbsent(memberId, id -> new PartyLevels());
-
-			levels.setBoosted(stat, boostedLevel);
-			levels.setReal(stat, level);
-		});
-	}
-
-	/**
 	 * What the client's own party plugin already shares, which covers hitpoints, prayer and special
 	 * attack for anyone running it, with or without this plugin. A status carries only the parts of
 	 * itself that changed, so each half of each stat is taken on its own and the rest of what is known
@@ -323,9 +331,8 @@ public class BoostIconPlugin extends Plugin
 	public void onStatusUpdate(StatusUpdate event)
 	{
 		long memberId = event.getMemberId();
-		PartyMember local = partyService.getLocalMember();
 
-		if (!settings.partyStats() || (local != null && local.getMemberId() == memberId))
+		if (!settings.partyStats())
 		{
 			return;
 		}
@@ -334,7 +341,12 @@ public class BoostIconPlugin extends Plugin
 
 		clientThread.invoke(() ->
 		{
-			PartyLevels levels = partyLevels.computeIfAbsent(memberId, id -> new PartyLevels());
+			if (isOwn(memberId))
+			{
+				return;
+			}
+
+			PartyLevels levels = levelsFor(memberId);
 
 			set(levels, CombatStat.HITPOINTS, event.getHealthCurrent(), event.getHealthMax());
 			set(levels, CombatStat.PRAYER, event.getPrayerCurrent(), event.getPrayerMax());
@@ -351,15 +363,51 @@ public class BoostIconPlugin extends Plugin
 	 */
 	private static void set(PartyLevels levels, CombatStat stat, Integer boostedLevel, Integer realLevel)
 	{
-		if (boostedLevel != null && stat.isPossible(boostedLevel))
+		if (boostedLevel != null && stat.isPossibleNow(boostedLevel))
 		{
 			levels.setBoosted(stat, boostedLevel);
 		}
 
-		if (realLevel != null && stat.isPossible(realLevel))
+		if (realLevel != null && stat.isPossibleReal(realLevel))
 		{
 			levels.setReal(stat, realLevel);
 		}
+	}
+
+	/**
+	 * The name of the player a party member is playing as. The party itself knows them by an id and
+	 * nothing more: a name is put to one by the party plugin that comes with the client, and only while
+	 * that plugin is running, so what a member shared of their own name comes first. That is what lets
+	 * the icons appear for a team running this plugin and not that one.
+	 */
+	private static String nameOf(PartyMember member, PartyLevels levels)
+	{
+		String shared = levels.getName();
+
+		if (shared != null)
+		{
+			return shared;
+		}
+
+		// Set alongside the name by the party plugin, so a member it has not named is a member still
+		// going by the stand-in name every member starts out with
+		return member.isLoggedIn() ? member.getDisplayName() : null;
+	}
+
+	/**
+	 * Whether a member id is our own. Our levels are read from the client rather than taken off the
+	 * party, so our own share of them coming back around is dropped.
+	 */
+	private boolean isOwn(long memberId)
+	{
+		PartyMember local = partyService.getLocalMember();
+
+		return local != null && local.getMemberId() == memberId;
+	}
+
+	private PartyLevels levelsFor(long memberId)
+	{
+		return partyLevels.computeIfAbsent(memberId, id -> new PartyLevels());
 	}
 
 	/**
@@ -451,18 +499,24 @@ public class BoostIconPlugin extends Plugin
 			return;
 		}
 
-		if (Arrays.equals(boosted, sentBoosted) && Arrays.equals(real, sentReal))
+		Player local = client.getLocalPlayer();
+		String name = local == null ? null : local.getName();
+
+		if (Objects.equals(name, sentName)
+			&& Arrays.equals(boosted, sentBoosted) && Arrays.equals(real, sentReal))
 		{
 			return;
 		}
 
+		sentName = name;
 		sentBoosted = boosted.clone();
 		sentReal = real.clone();
-		partyService.send(new BoostIconStats(sentBoosted, sentReal));
+		partyService.send(new BoostIconStats(sentName, sentBoosted, sentReal));
 	}
 
 	private void forgetSent()
 	{
+		sentName = null;
 		sentBoosted = null;
 		sentReal = null;
 	}

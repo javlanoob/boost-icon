@@ -80,12 +80,21 @@ enum CombatStat
 	}
 
 	/**
-	 * Whether a number is one this stat could be at, so that nothing is made of a stat arriving from
-	 * elsewhere as something it cannot be. Levels start at one, while a special attack bar can be
-	 * empty, which is where a spec leaves it.
+	 * Whether a number is one this stat could be sitting at, so that nothing is made of a stat arriving
+	 * from elsewhere as something it cannot be. Nought is where a spec leaves the bar and where a prayer
+	 * runs out, so it is somewhere a stat really is rather than a number to throw away.
 	 */
-	boolean isPossible(int level)
+	boolean isPossibleNow(int level)
 	{
-		return isPercent() ? level >= 0 && level <= FULL_PERCENT : level >= 1;
+		return level >= 0 && (!isPercent() || level <= FULL_PERCENT);
+	}
+
+	/**
+	 * Whether a number is one this stat could be at with nothing acting on it. That is a level, and a
+	 * level is at least one, which is the whole of the difference from the amount above.
+	 */
+	boolean isPossibleReal(int level)
+	{
+		return level >= 1 && (!isPercent() || level <= FULL_PERCENT);
 	}
 }

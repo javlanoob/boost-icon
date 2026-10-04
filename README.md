@@ -52,9 +52,11 @@ still kept up to date and still shared with the party while they are away.
 
 **Party stats**: with this on, the same icons appear over the heads of the party members around you.
 
-Hitpoints, prayer and special attack arrive from anyone running the Party plugin that comes with the
-client, whether or not they have this one, since that is what it already shares with the party. The five
-levelled stats come only from party members running Boosted Icon with the setting on.
+The five levelled stats come from party members running Boosted Icon with the setting on, and need
+nothing else of either of you.
+
+Hitpoints, prayer and special attack also arrive from anyone running the Party plugin that comes with the
+client, whether or not they have this one, since that is what it already shares with the party.
 
 What arrives either way is levels rather than the boosts worked out from them, so your own settings
 decide what you see of theirs.

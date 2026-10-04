@@ -16,6 +16,14 @@ import net.runelite.client.party.messages.PartyMemberMessage;
 public class BoostIconStats extends PartyMemberMessage
 {
 	/**
+	 * The name of the player the levels belong to. The party knows its members by an id and nothing else,
+	 * and the only thing that ever puts a name to one is the party plugin that comes with the client, so
+	 * the name travels with the levels rather than there being no way to place them without that plugin.
+	 */
+	@SerializedName("n")
+	String name;
+
+	/**
 	 * The level each combat stat is at now, in {@link CombatStat} order.
 	 */
 	@SerializedName("b")
