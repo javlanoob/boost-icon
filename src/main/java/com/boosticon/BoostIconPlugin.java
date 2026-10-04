@@ -117,9 +117,16 @@ public class BoostIconPlugin extends Plugin
 		keyManager.unregisterKeyListener(toggle);
 		hidden = false;
 		wsClient.unregisterMessage(BoostIconStats.class);
-		columns.clear();
-		partyLevels.clear();
-		forgetSent();
+
+		// A plugin is stopped on the Swing thread, while everything it has read of the game is written
+		// and read a tick at a time on the client's own. Letting go of it over there keeps all of it to
+		// the one thread, rather than emptying a list the tick in flight is still walking through
+		clientThread.invoke(() ->
+		{
+			columns.clear();
+			partyLevels.clear();
+			forgetSent();
+		});
 	}
 
 	@Provides
