@@ -4,13 +4,16 @@ import com.google.inject.Provides;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import javax.inject.Inject;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.Player;
+import net.runelite.api.Skill;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.gameval.VarPlayerID;
@@ -20,14 +23,15 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.events.PartyChanged;
 import net.runelite.client.input.KeyManager;
+import net.runelite.client.party.PartyDataService;
+import net.runelite.client.party.PartyDataType;
 import net.runelite.client.party.PartyMember;
 import net.runelite.client.party.PartyService;
-import net.runelite.client.party.WSClient;
 import net.runelite.client.party.events.UserPart;
+import net.runelite.client.party.messages.PartyData;
 import net.runelite.client.party.messages.UserSync;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.plugins.party.messages.StatusUpdate;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.HotkeyListener;
 import net.runelite.client.util.Text;
@@ -40,6 +44,17 @@ import net.runelite.client.util.Text;
 public class BoostIconPlugin extends Plugin
 {
 	private static final CombatStat[] STATS = CombatStat.ALL;
+
+	/**
+	 * The stats asked of the party, which is every one of them that is a skill. Special attack is not a
+	 * skill and is asked for alongside them, with the name of the player the stats belong to.
+	 */
+	private static final Skill[] PARTY_SKILLS = Arrays.stream(STATS)
+		.map(CombatStat::getSkill)
+		.filter(Objects::nonNull)
+		.toArray(Skill[]::new);
+
+	private static final PartyDataType[] PARTY_TYPES = {PartyDataType.CHARACTER_NAME, PartyDataType.SPEC};
 
 	@Inject
 	private Client client;
@@ -60,7 +75,7 @@ public class BoostIconPlugin extends Plugin
 	private PartyService partyService;
 
 	@Inject
-	private WSClient wsClient;
+	private PartyDataService partyDataService;
 
 	@Inject
 	private KeyManager keyManager;
@@ -90,16 +105,10 @@ public class BoostIconPlugin extends Plugin
 	private volatile Settings settings;
 
 	/**
-	 * The levels each party member has shared, held until they share different ones or leave.
+	 * The members who have shared a special attack bar. An empty bar and one never heard of both read as
+	 * nought off the party, which is the one stat where nought is a real amount to be at.
 	 */
-	private final Map<Long, PartyLevels> partyLevels = new HashMap<>();
-
-	/**
-	 * What was last sent to the party, so a tick that changed nothing sends nothing.
-	 */
-	private String sentName;
-	private int[] sentBoosted;
-	private int[] sentReal;
+	private final Set<Long> specShared = new HashSet<>();
 
 	@Override
 	protected void startUp()
@@ -107,7 +116,12 @@ public class BoostIconPlugin extends Plugin
 		settings = new Settings(config);
 		overlayManager.add(overlay);
 		keyManager.registerKeyListener(toggle);
-		wsClient.registerMessage(BoostIconStats.class);
+
+		if (settings.partyStats())
+		{
+			subscribe();
+			requestSync();
+		}
 	}
 
 	@Override
@@ -116,7 +130,7 @@ public class BoostIconPlugin extends Plugin
 		overlayManager.remove(overlay);
 		keyManager.unregisterKeyListener(toggle);
 		hidden = false;
-		wsClient.unregisterMessage(BoostIconStats.class);
+		unsubscribe();
 
 		// A plugin is stopped on the Swing thread, while everything it has read of the game is written
 		// and read a tick at a time on the client's own. Letting go of it over there keeps all of it to
@@ -124,8 +138,7 @@ public class BoostIconPlugin extends Plugin
 		clientThread.invoke(() ->
 		{
 			columns.clear();
-			partyLevels.clear();
-			forgetSent();
+			specShared.clear();
 		});
 	}
 
@@ -177,56 +190,50 @@ public class BoostIconPlugin extends Plugin
 		int[] boosted = new int[STATS.length];
 		int[] real = new int[STATS.length];
 
-		for (int i = 0; i < STATS.length; i++)
-		{
-			boosted[i] = now(STATS[i]);
-			real[i] = full(STATS[i]);
-		}
+		own(boosted, real);
 
 		if (settings.showSelf())
 		{
 			addColumn(settings, client.getLocalPlayer(), boosted, real);
 		}
 
-		share(settings, boosted, real);
-
 		if (!settings.partyStats() || !partyService.isInParty())
 		{
-			partyLevels.clear();
+			specShared.clear();
 			return;
 		}
 
-		if (partyLevels.isEmpty())
+		List<PartyMember> members = partyService.getMembers();
+
+		if (members.size() < 2)
 		{
-			// Nobody has shared anything, so there is nobody to go looking for among the players around
+			// Nobody but us, so there is nobody to go looking for among the players around
 			return;
 		}
 
 		Map<String, Player> nearby = playersByName();
 		PartyMember local = partyService.getLocalMember();
 
-		for (PartyMember member : partyService.getMembers())
+		for (PartyMember member : members)
 		{
-			if (local != null && member.getMemberId() == local.getMemberId())
+			// A member the party has not named is one still going by the stand-in name they start out
+			// with, which is nobody
+			if (!member.isLoggedIn() || (local != null && member.getMemberId() == local.getMemberId()))
 			{
 				continue;
 			}
 
-			PartyLevels levels = partyLevels.get(member.getMemberId());
+			Player player = nearby.get(Text.standardize(member.getDisplayName()));
 
-			if (levels == null)
+			if (player == null)
 			{
 				continue;
 			}
 
-			String name = nameOf(member, levels);
-
-			if (name == null)
-			{
-				continue;
-			}
-
-			addColumn(settings, nearby.get(Text.standardize(name)), levels.getBoosted(), levels.getReal());
+			// Read into the same pair, since our own column was made from them already and a member's
+			// is made from them here and then
+			shared(member, boosted, real);
+			addColumn(settings, player, boosted, real);
 		}
 	}
 
@@ -236,7 +243,6 @@ public class BoostIconPlugin extends Plugin
 		if (event.getGameState() != GameState.LOGGED_IN)
 		{
 			columns.clear();
-			forgetSent();
 		}
 	}
 
@@ -246,11 +252,7 @@ public class BoostIconPlugin extends Plugin
 	@Subscribe
 	public void onPartyChanged(PartyChanged event)
 	{
-		clientThread.invoke(() ->
-		{
-			partyLevels.clear();
-			forgetSent();
-		});
+		clientThread.invoke(specShared::clear);
 
 		requestSync();
 	}
@@ -268,153 +270,58 @@ public class BoostIconPlugin extends Plugin
 
 		if ("partyStats".equals(event.getKey()))
 		{
-			requestSync();
+			if (settings.partyStats())
+			{
+				subscribe();
+				requestSync();
+			}
+			else
+			{
+				unsubscribe();
+				clientThread.invoke(specShared::clear);
+			}
 		}
 	}
 
+	/**
+	 * A party member saying what their stats are at. The stats themselves are read off the member when a
+	 * column is made from them, so all this takes from the message is that a special attack bar has been
+	 * heard of: an empty bar reads as nought, and so does a bar nobody has said anything about.
+	 */
 	@Subscribe
-	public void onBoostIconStats(BoostIconStats message)
+	public void onPartyData(PartyData event)
 	{
-		int[] boosted = message.getBoosted();
-		int[] real = message.getReal();
-
-		if (boosted == null || real == null
-			|| boosted.length != STATS.length || real.length != STATS.length)
+		if (event.getSpecEnergy() == null)
 		{
 			return;
 		}
 
-		long memberId = message.getMemberId();
-		String name = message.getName();
+		long memberId = event.getMemberId();
 
-		if (!settings.partyStats())
-		{
-			return;
-		}
-
-		clientThread.invoke(() ->
-		{
-			if (isOwn(memberId))
-			{
-				return;
-			}
-
-			PartyLevels levels = levelsFor(memberId);
-
-			if (name != null && !name.isEmpty())
-			{
-				levels.setName(name);
-			}
-
-			for (int i = 0; i < STATS.length; i++)
-			{
-				set(levels, STATS[i], boosted[i], real[i]);
-			}
-		});
+		clientThread.invoke(() -> specShared.add(memberId));
 	}
 
 	@Subscribe
 	public void onUserPart(UserPart event)
 	{
-		clientThread.invoke(() -> partyLevels.remove(event.getMemberId()));
+		clientThread.invoke(() -> specShared.remove(event.getMemberId()));
 	}
 
 	/**
-	 * Somebody has just joined and has nothing of anyone's yet, so the next tick sends again.
+	 * Asks the client to keep the stats up to date, which is what has them sent around the party as
+	 * well: what is asked for here is what is sent for us and what arrives for everyone else, so this
+	 * is what makes the party half of the plugin work, whoever in it is running which plugin.
 	 */
-	@Subscribe
-	public void onUserSync(UserSync event)
+	private void subscribe()
 	{
-		clientThread.invoke(this::forgetSent);
+		partyDataService.subscribe(this, PARTY_TYPES);
+		partyDataService.subscribe(this, PARTY_SKILLS);
 	}
 
-	/**
-	 * What the client's own party plugin already shares, which covers hitpoints, prayer and special
-	 * attack for anyone running it, with or without this plugin. A status carries only the parts of
-	 * itself that changed, so each half of each stat is taken on its own and the rest of what is known
-	 * about that member is left as it was.
-	 */
-	@Subscribe
-	public void onStatusUpdate(StatusUpdate event)
+	private void unsubscribe()
 	{
-		long memberId = event.getMemberId();
-
-		if (!settings.partyStats())
-		{
-			return;
-		}
-
-		Integer spec = event.getSpecEnergy();
-
-		clientThread.invoke(() ->
-		{
-			if (isOwn(memberId))
-			{
-				return;
-			}
-
-			PartyLevels levels = levelsFor(memberId);
-
-			set(levels, CombatStat.HITPOINTS, event.getHealthCurrent(), event.getHealthMax());
-			set(levels, CombatStat.PRAYER, event.getPrayerCurrent(), event.getPrayerMax());
-
-			// A bar is full at the same amount for everyone, so it is known as soon as the amount is
-			set(levels, CombatStat.SPECIAL, spec, spec == null ? null : CombatStat.FULL_PERCENT);
-		});
-	}
-
-	/**
-	 * One stat out of a status, where either half can be missing because it had not changed. Levels
-	 * come from whoever is sharing them and are taken as nothing more than numbers, so anything a stat
-	 * could not be at is dropped rather than drawn.
-	 */
-	private static void set(PartyLevels levels, CombatStat stat, Integer boostedLevel, Integer realLevel)
-	{
-		if (boostedLevel != null && stat.isPossibleNow(boostedLevel))
-		{
-			levels.setBoosted(stat, boostedLevel);
-		}
-
-		if (realLevel != null && stat.isPossibleReal(realLevel))
-		{
-			levels.setReal(stat, realLevel);
-		}
-	}
-
-	/**
-	 * The name of the player a party member is playing as. The party itself knows them by an id and
-	 * nothing more: a name is put to one by the party plugin that comes with the client, and only while
-	 * that plugin is running, so what a member shared of their own name comes first. That is what lets
-	 * the icons appear for a team running this plugin and not that one.
-	 */
-	private static String nameOf(PartyMember member, PartyLevels levels)
-	{
-		String shared = levels.getName();
-
-		if (shared != null)
-		{
-			return shared;
-		}
-
-		// Set alongside the name by the party plugin, so a member it has not named is a member still
-		// going by the stand-in name every member starts out with
-		return member.isLoggedIn() ? member.getDisplayName() : null;
-	}
-
-	/**
-	 * Whether a member id is our own. Our levels are read from the client rather than taken off the
-	 * party, so our own share of them coming back around is dropped.
-	 */
-	private boolean isOwn(long memberId)
-	{
-		PartyMember local = partyService.getLocalMember();
-
-		return local != null && local.getMemberId() == memberId;
-	}
-
-	private PartyLevels levelsFor(long memberId)
-	{
-		return partyLevels.computeIfAbsent(memberId, id -> new PartyLevels());
+		partyDataService.unsubscribe(this, PARTY_TYPES);
+		partyDataService.unsubscribe(this, PARTY_SKILLS);
 	}
 
 	/**
@@ -460,7 +367,7 @@ public class BoostIconPlugin extends Plugin
 		{
 			CombatStat stat = STATS[i];
 
-			if (boosted[i] == PartyLevels.UNKNOWN || real[i] == PartyLevels.UNKNOWN)
+			if (boosted[i] == CombatStat.UNKNOWN || real[i] == CombatStat.UNKNOWN)
 			{
 				continue;
 			}
@@ -498,34 +405,60 @@ public class BoostIconPlugin extends Plugin
 		}
 	}
 
-	private void share(Settings settings, int[] boosted, int[] real)
+	/**
+	 * Our own stats, read off the client.
+	 */
+	private void own(int[] boosted, int[] real)
 	{
-		if (!settings.partyStats() || !partyService.isInParty())
+		for (int i = 0; i < STATS.length; i++)
 		{
-			forgetSent();
-			return;
+			CombatStat stat = STATS[i];
+
+			set(boosted, real, i, now(stat), full(stat));
 		}
-
-		Player local = client.getLocalPlayer();
-		String name = local == null ? null : local.getName();
-
-		if (Objects.equals(name, sentName)
-			&& Arrays.equals(boosted, sentBoosted) && Arrays.equals(real, sentReal))
-		{
-			return;
-		}
-
-		sentName = name;
-		sentBoosted = boosted.clone();
-		sentReal = real.clone();
-		partyService.send(new BoostIconStats(sentName, sentBoosted, sentReal));
 	}
 
-	private void forgetSent()
+	/**
+	 * A party member's stats, as the party has them. Only what somebody's own plugins ask for is sent
+	 * for them, so a stat nobody is keeping up to date arrives as nought, and nought is a level nobody
+	 * is at. The two that really do run down to nothing are points rather than a level, and their level
+	 * still has to have arrived for there to be anything to draw.
+	 */
+	private void shared(PartyMember member, int[] boosted, int[] real)
 	{
-		sentName = null;
-		sentBoosted = null;
-		sentReal = null;
+		boolean spec = specShared.contains(member.getMemberId());
+
+		for (int i = 0; i < STATS.length; i++)
+		{
+			CombatStat stat = STATS[i];
+
+			if (stat.isPercent())
+			{
+				// A bar is full at the same amount for everyone, so it is known as soon as the amount is
+				set(boosted, real, i, spec ? member.getSpecEnergy() : CombatStat.UNKNOWN, CombatStat.FULL_PERCENT);
+				continue;
+			}
+
+			set(boosted, real, i, member.getStatBoost(stat.getSkill()), member.getStatBase(stat.getSkill()));
+		}
+	}
+
+	/**
+	 * One stat of a set, taken as read only where both halves of it are somewhere the stat really sits.
+	 * A level that has not arrived is nought, whether it is the game that has yet to send it or its owner
+	 * that has yet to share it, and nought is a level nobody is at: taken for a drain, it reads as a stat
+	 * however far below itself until the rest of it turns up. Hitpoints, prayer and the special attack
+	 * bar are points rather than a level and do run down to nothing, so for those the amount left is
+	 * taken as it comes, and it is their level that has to have arrived for there to be anything to draw.
+	 */
+	private static void set(int[] boosted, int[] real, int index, int now, int level)
+	{
+		CombatStat stat = STATS[index];
+		boolean known = stat.isPossibleReal(level)
+			&& (stat.isPoints() ? stat.isPossibleNow(now) : now >= 1);
+
+		boosted[index] = known ? now : CombatStat.UNKNOWN;
+		real[index] = known ? level : CombatStat.UNKNOWN;
 	}
 
 	/**

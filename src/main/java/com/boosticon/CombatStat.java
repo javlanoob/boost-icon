@@ -27,6 +27,11 @@ enum CombatStat
 	static final int FULL_PERCENT = 100;
 
 	/**
+	 * A stat nothing is known of, which is neither a level nor an amount of anything and is not drawn.
+	 */
+	static final int UNKNOWN = -1;
+
+	/**
 	 * Every stat, in order. Kept rather than asked for each time, since asking hands out a fresh copy of
 	 * the list and this is walked for every player, every tick.
 	 */
